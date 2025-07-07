@@ -351,6 +351,10 @@ class CalrissianJob:
             ["--max-ram", f"{self.max_ram}", "--max-cores", f"{self.max_cores}"]
         )
 
+        args.extend(
+            ["--max-gpus", "1", "--max-cores"]
+        )
+
         args.extend(["--tmp-outdir-prefix", f"{self.calrissian_base_path}/"])
 
         args.extend(["--outdir", f"{self.calrissian_base_path}/"])
