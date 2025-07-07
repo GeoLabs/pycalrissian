@@ -66,17 +66,16 @@ pycalrissian = ["pycalrissian"]
 tests = ["tests"]
 
 [tool.hatch.envs.default]
-skip-install = false
 dependencies = [
     "nose2",
     "coverage",
     "loguru",
     "typing-extensions==4.8.0",
     "kubernetes==26.1.0",
-    "cwltool==3.1.20240708091337",
+    "cwltool==3.1.20230106140217",
+    "cwl-utils==0.14",
     "setuptools==70.0.0"
 ]
-
 ## [project.scripts]
 ## pycalrissian = "pycalrissian/__init__"
 
