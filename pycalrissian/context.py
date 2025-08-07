@@ -196,31 +196,43 @@ class CalrissianContext:
             logger.info("create resource quota")
             self.create_resource_quota(name="calrissian-resource-quota")
 
-    def dispose(self):
-
+    def dispose(self, preserve_namespace: bool = False):
+        # Delete all pods
         response = self.core_v1_api.list_namespaced_pod(self.namespace)
 
         for pod in response.items:
             logger.info(f"delete pod {pod.metadata.name}")
             self.delete_pod(pod.metadata.name)
 
-        logger.info(f"dispose namespace {self.namespace}")
+        # Delete PVC
+        try:
+            logger.info(f"delete PVC {self.calrissian_wdir}")
+            self.core_v1_api.delete_namespaced_persistent_volume_claim(
+                name=self.calrissian_wdir,
+                namespace=self.namespace,
+                grace_period_seconds=0,
+                propagation_policy="Foreground",
+            )
+        except ApiException as e:
+            logger.warning(f"PVC {self.calrissian_wdir} could not be deleted: {e}")
+
+        # Preserve namespace if requested
+        if preserve_namespace:
+            logger.info(f"Preserving dedicated namespace: {self.namespace}")
+            return
+
+        # Delete namespace
+        logger.info(f"Deleting namespace {self.namespace}")
         try:
             response = self.core_v1_api.delete_namespace(
                 name=self.namespace, pretty=True, grace_period_seconds=0
             )
-
-            # if not self.retry(self.dispose):
-            #     raise ApiException()
-            logger.info(f"namespace {self.namespace} deleted")
+            logger.info(f"Namespace {self.namespace} deleted")
             return response
-
         except ApiException as e:
-            logger.info(
-                f"namespace {self.namespace} not deleted "
-                "in the time interval assigned"
-            )
+            logger.error(f"Failed to delete namespace {self.namespace}: {e}")
             raise e
+
 
     def delete_pod(self, name):
 
