@@ -196,9 +196,14 @@ class CalrissianContext:
             logger.info("create resource quota")
             self.create_resource_quota(name="calrissian-resource-quota")
 
-    def dispose(self, preserve_namespace: bool = False):
+    def dispose(self, preserve_namespace: bool = False, job_name=None):
         # Delete all pods
-        response = self.core_v1_api.list_namespaced_pod(self.namespace)
+        if preserve_namespace and job_name is not None:
+            label_selector = f"job-name={job_name}"
+            response = self.core_v1_api.list_namespaced_pod(self.namespace, label_selector=label_selector)
+        else:
+            response = self.core_v1_api.list_namespaced_pod(self.namespace)
+
 
         for pod in response.items:
             logger.info(f"delete pod {pod.metadata.name}")
@@ -232,7 +237,6 @@ class CalrissianContext:
         except ApiException as e:
             logger.error(f"Failed to delete namespace {self.namespace}: {e}")
             raise e
-
 
     def delete_pod(self, name):
 
