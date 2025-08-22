@@ -361,6 +361,10 @@ class CalrissianJob:
             ["--max-ram", f"{self.max_ram}", "--max-cores", f"{self.max_cores}"]
         )
 
+        args.extend(
+            ["--max-gpus", "1"]
+        )
+
         args.extend(["--tmp-outdir-prefix", f"{self.calrissian_base_path}/"])
 
         args.extend(["--outdir", f"{self.calrissian_base_path}/"])
@@ -377,6 +381,8 @@ class CalrissianJob:
             args.extend(
                 ["--pod-env-vars", os.path.join("/pod-env-vars", "pod_env_vars.json")]
             )
+        if self.service_account:
+            args.extend(["--pod-serviceaccount", self.service_account])
 
         if self.debug:
             args.append("--debug")
