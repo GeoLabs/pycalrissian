@@ -463,19 +463,22 @@ class CalrissianContext:
 
         role_ref = client.V1RoleRef(api_group="", kind="Role", name=role)
 
+        service_account = self.service_account or "default"
+        logger.info(f"Using service account {service_account}")
+
         # Check the version of the client to determine the correct class to use
         if Version(client.__version__) < Version("29.0.0"):
             subject = client.models.V1Subject(
                 api_group="",
                 kind="ServiceAccount",
-                name="default",
+                name=service_account,
                 namespace=self.namespace,
             )
         else:
             subject = client.models.RbacV1Subject(
                 api_group="",
                 kind="ServiceAccount",
-                name="default",
+                name=service_account,
                 namespace=self.namespace,
             )
 
@@ -706,9 +709,10 @@ class CalrissianContext:
 
     def patch_service_account(self):
         # adds a secret to the namespace default service account
-
+        service_account = self.service_account or "default"
+        logger.info(f"Patching sercice account: {service_account}")
         service_account_body = self.core_v1_api.read_namespaced_service_account(
-            name="default", namespace=self.namespace
+            name=service_account, namespace=self.namespace
         )
 
         if service_account_body.secrets is None:
@@ -725,7 +729,7 @@ class CalrissianContext:
 
         try:
             self.core_v1_api.patch_namespaced_service_account(
-                name="default",
+                name=service_account,
                 namespace=self.namespace,
                 body=service_account_body,
                 pretty=True,
