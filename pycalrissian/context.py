@@ -25,7 +25,7 @@ class CalrissianContext:
         image_pull_secrets: Dict = None,
         kubeconfig_file: TextIO = None,
         labels: Dict = None,
-        annotations: Dict = None,
+        annotations: Dict = None
     ):
         """Creates a CalrissianContext object
 
@@ -75,7 +75,7 @@ class CalrissianContext:
         image_pull_secrets: Optional[Dict] = None,
         kubeconfig_file: Optional[TextIO] = None,
         labels: Optional[Dict] = None,
-        annotations: Optional[Dict] = None,
+        annotations: Optional[Dict] = None
     ) -> "CalrissianContext":
         """
         Creates a CalrissianContext for an existing Kubernetes namespace.
@@ -122,7 +122,7 @@ class CalrissianContext:
 
         if self.existing_namespace is False:
             if not self.is_namespace_created():
-                logger.info(f"create namespace '{self.namespace}'.")
+                logger.info(f"create namespace '{self.namespace}'. with annotations'{self.annotations}'")
                 self.create_namespace(labels=self.labels, annotations=self.annotations)
 
             # create roles and role binding
@@ -198,12 +198,13 @@ class CalrissianContext:
 
     def dispose(self, preserve_namespace: bool = False, job_name=None):
         # Delete all pods
+        logger.info(f"context disposing job_name: {job_name}")
+
         if preserve_namespace and job_name is not None:
             label_selector = f"job-name={job_name}"
             response = self.core_v1_api.list_namespaced_pod(self.namespace, label_selector=label_selector)
         else:
             response = self.core_v1_api.list_namespaced_pod(self.namespace)
-
 
         for pod in response.items:
             logger.info(f"delete pod {pod.metadata.name}")
@@ -389,7 +390,7 @@ class CalrissianContext:
             logger.info(f"namespace {self.namespace} exists, skipping creation")
             return self.core_v1_api.read_namespace(name=self.namespace)
 
-        logger.info(f"creating namespace {self.namespace}")
+        logger.info(f"creating namespace {self.namespace} with labels '{labels}' annotations '{annotations}'")
         try:
             body = client.V1Namespace(
                 metadata=client.V1ObjectMeta(

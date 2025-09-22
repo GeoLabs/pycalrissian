@@ -24,10 +24,12 @@ class HelperPod:
         context: CalrissianContext,
         volume: Dict,
         volume_mount: Dict,
+        labels: Dict,
     ):
         self.context = context
         self.volume = volume
         self.volume_mount = volume_mount
+        self.labels = labels
         self.container_name = "container-kube-cp"
         self.pod_name = f"kube-cp-{self._get_uid()}"
 
@@ -41,7 +43,10 @@ class HelperPod:
         pod_manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": self.pod_name},
+            "metadata": {
+                "name": self.pod_name,
+                "labels": self.labels
+            },
             "spec": {
                 "volumes": [self.volume],
                 "containers": [
@@ -322,11 +327,14 @@ def copy_to_volume(
     volume_mount: Dict,
     source_paths: list,
     destination_path: str,
+    labels: Dict = {},
+
 ):
     helper_pod = HelperPod(
         context=context,
         volume=volume,
         volume_mount=volume_mount,
+        labels=labels
     )
 
     try:
@@ -354,11 +362,13 @@ def copy_from_volume(
     volume_mount: Dict,
     source_paths: list,
     destination_path: str,
+    labels: Dict = None,
 ):
     helper_pod = HelperPod(
         context=context,
         volume=volume,
         volume_mount=volume_mount,
+        labels=labels
     )
 
     try:

@@ -12,6 +12,7 @@ from pycalrissian.context import CalrissianContext
 from pycalrissian.job import CalrissianJob, ContainerNames
 from pycalrissian.utils import copy_from_volume
 
+SIDECAR_PREFIXES = ("vault-agent", "istio-proxy", "otel-collector")
 
 class JobStatus(Enum):
     ACTIVE = "active"
@@ -42,19 +43,33 @@ class CalrissianExecution:
         if self.killed:
             return JobStatus.KILLED
         try:
-            response = self.runtime_context.batch_v1_api.read_namespaced_job_status(
-                name=self.namespaced_job_name,
+            # Prefer container status of the Job's pod
+            pods = self.runtime_context.core_v1_api.list_namespaced_pod(
                 namespace=self.runtime_context.namespace,
-                pretty=True,
-            )
-            if response.status.active is None and response.status.start_time is None:
-                return JobStatus.ACTIVE
-            if response.status.active:
-                return JobStatus.ACTIVE
-            if response.status.succeeded:
-                return JobStatus.SUCCEEDED
-            if response.status.failed:
-                return JobStatus.FAILED
+                label_selector=f"job-name={self.namespaced_job_name}",
+                timeout_seconds=10,
+            ).items
+            if pods:
+                p = pods[0]
+                cs = next((cs for cs in (p.status.container_statuses or [])
+                        if cs.name == ContainerNames.CALRISSIAN.value), None)
+                if cs and cs.state and cs.state.terminated:
+                    return (JobStatus.SUCCEEDED if cs.state.terminated.exit_code == 0
+                            else JobStatus.FAILED)
+                response = self.runtime_context.batch_v1_api.read_namespaced_job_status(
+                    name=self.namespaced_job_name,
+                    namespace=self.runtime_context.namespace,
+                    pretty=True,
+                )
+                # Fall back to Job status if container hasn't terminated yet
+                if response.status.active is None and response.status.start_time is None:
+                    return JobStatus.ACTIVE
+                if response.status.active:
+                    return JobStatus.ACTIVE
+                if response.status.succeeded:
+                    return JobStatus.SUCCEEDED
+                if response.status.failed:
+                    return JobStatus.FAILED
             return None
         except ApiException as e:
             logger.error(f"Exception when calling get status: {e}\n")
@@ -78,20 +93,34 @@ class CalrissianExecution:
 
     def get_output(self) -> Dict:
         """Returns the job output"""
-        if self.is_succeeded:
-            filename = self.get_file_from_volume(["output.json"])[0]
-            with open(filename, "r") as staged_file:
-                return json.load(staged_file)
+        if self.is_succeeded():
+            try:
+                filename = self.get_file_from_volume(["output.json"])[0]
+                with open(filename, "r") as staged_file:
+                    return json.load(staged_file)
+            except json.decoder.JSONDecodeError:
+                logger.info("output.json cannot be decoded. Bad file format.")
+                return {}
+            except Exception as e:
+                logger.info(f"output.json Bad file. Uncaught {e}")
+                return {}
+        return {}
 
     def get_usage_report(self) -> Dict:
         """Returns the job usage report"""
-        if self.is_complete:
+        if self.is_complete():
             try:
                 filename = self.get_file_from_volume(["report.json"])[0]
                 with open(filename, "r") as staged_file:
                     return json.load(staged_file)
             except json.decoder.JSONDecodeError:
+                logger.info("report.json cannot be decoded. Bad file format.")
                 return {}
+            except Exception as e:
+                logger.info(f"report.json Bad file. Uncaught {e}")
+                return {}
+
+        return {}
 
     def get_file_from_volume(self, filenames):
 
@@ -116,55 +145,125 @@ class CalrissianExecution:
                 for filename in filenames
             ],
             destination_path=destination_path,
+            labels=self.runtime_context.labels
         )
 
         return [os.path.join(destination_path, filename) for filename in filenames]
 
     def get_log(self):
         """Returns the job execution log"""
-        if self.is_complete:
+        if self.is_complete():
             return self._get_container_log(ContainerNames.CALRISSIAN)
         return None
 
     def get_tool_logs(self):
         """stages the tool logs from k8s volume"""
-        usage_report = self.get_usage_report()
-        if "children" in usage_report.keys():
-            self.get_file_from_volume(
-                [
-                    os.path.join(self.job.calrissian_base_path, tool["name"] + ".log")
+        try:
+            usage_report = self.get_usage_report()
+            if "children" in usage_report.keys():
+                self.get_file_from_volume(
+                    [
+                        os.path.join(self.job.calrissian_base_path, tool["name"] + ".log")
+                        for tool in usage_report["children"]
+                    ]
+                )
+
+                return [
+                    os.path.join(".", tool["name"] + ".log")
                     for tool in usage_report["children"]
                 ]
-            )
+        except json.decoder.JSONDecodeError:
+            logger.info("getting tool log decode. Bad file format.")
+            return []
+        except Exception as e:
+            logger.info(f"output.json Bad file. Uncaught {e}")
+            return []
 
-            return [
-                os.path.join(".", tool["name"] + ".log")
-                for tool in usage_report["children"]
-            ]
+
+    def _pick_workload_container_name(self, pod: V1Pod, preferred: Optional[str]) -> str:
+        if preferred:
+            return preferred
+        for c in (pod.spec.containers or []):
+            if not any(c.name.startswith(p) for p in SIDECAR_PREFIXES):
+                return c.name
+        return pod.spec.containers[0].name
+
+    def _get_container_status(self, pod: V1Pod, name: str):
+        for cs in (pod.status.container_statuses or []):
+            if cs.name == name:
+                return cs
+        return None
+
+    def _wait_until_container_starts(self, pod: V1Pod, container_name: str, timeout_s: int = 120):
+        """Block until container is Running or Terminated, otherwise raise after timeout."""
+        import time
+        start = time.time()
+        while True:
+            cs = self._get_container_status(pod, container_name)
+            if cs and cs.state and (cs.state.running or cs.state.terminated):
+                return cs
+            if time.time() - start > timeout_s:
+                raise RuntimeError(f"Container {container_name} did not start within {timeout_s}s (state={cs.state if cs else None})")
+            time.sleep(1)
+            # refresh pod
+            pod = self.runtime_context.core_v1_api.read_namespaced_pod(
+                name=pod.metadata.name, namespace=self.runtime_context.namespace
+            )
 
     def _get_container_log(self, container):
-
         try:
-
-            pod_label_selector = f"job-name={self.job.job_name}"
+            logger.info(f"Getting logs for container: {str(container)}")
+            # 1) pick the Job pod (newest if there are retries)
             pods_list = self.runtime_context.core_v1_api.list_namespaced_pod(
                 namespace=self.runtime_context.namespace,
-                label_selector=pod_label_selector,
+                label_selector=f"job-name={self.job.job_name}",
                 timeout_seconds=10,
             )
-            pod_name = pods_list.items[0].metadata.name
+            if not pods_list.items:
+                raise RuntimeError(f"No pod found for job {self.job.job_name}")
 
-            return self.runtime_context.core_v1_api.read_namespaced_pod_log(
+            pod = sorted(
+                pods_list.items,
+                key=lambda p: (p.status.start_time or p.metadata.creation_timestamp),
+                reverse=True,
+            )[0]
+            pod_name = pod.metadata.name
+
+            # 2) choose the workload container (ignore sidecars)
+            desired = container.value  # typically "calrissian"
+            container_name = self._pick_workload_container_name(pod, desired)
+
+            # 3) wait until Running or Terminated (avoids 400 PodInitializing)
+            cs = self._wait_until_container_starts(pod, container_name)
+            read_previous = bool(cs.state.running and cs.restart_count)
+
+            # If the container is running now but has restarted in the past, you might want the prior logs:
+            resp = self.runtime_context.core_v1_api.read_namespaced_pod_log(
                 name=pod_name,
                 namespace=self.runtime_context.namespace,
+                container=container_name,
+                previous=read_previous,
                 _return_http_data_only=True,
                 _preload_content=False,
-                container=container.value,
-            ).data.decode("utf-8")
+            )
+            return resp.data.decode("utf-8")
 
         except ApiException as e:
-            logger.error(f"Exception when calling get status: {e}\n")
-            raise e
+            # Decode body safely (can be bytes)
+            body = e.body
+            if isinstance(body, (bytes, bytearray)):
+                body_text = body.decode("utf-8", "ignore")
+            else:
+                body_text = body or ""
+
+            # Handle common benign races gracefully
+            if e.status == 400 and (
+                "waiting to start" in body_text
+                or "previous terminated container" in body_text
+                or "not found" in body_text
+            ):
+                return ""
+
 
     def get_start_time(self):
         """Returns the start time"""
@@ -198,52 +297,55 @@ class CalrissianExecution:
             logger.error(f"Exception when calling get status: {e}\n")
             raise e
 
-    def monitor(
-        self, interval: int = 5, grace_period=120, wall_time: Optional[int] = None
-    ) -> None:
+    # Helper to delete the job correctly
+    def _delete_job(self, request_timeout: Optional[int] = None):
+        kwargs = {
+            "name": self.namespaced_job_name,
+            "namespace": self.runtime_context.namespace,
+            "body": self.runtime_context.batch_v1_api.V1DeleteOptions(
+                propagation_policy="Foreground",
+                grace_period_seconds=0,
+            ),
+        }
+        if request_timeout is not None:
+            kwargs["_request_timeout"] = request_timeout
+        try:
+            self.runtime_context.batch_v1_api.delete_namespaced_job(**kwargs)
+        except ApiException as e:
+            logger.error(f"failed to delete job {self.namespaced_job_name}: {e}")
 
-        if self.is_active():
-            iterations = 0
+    def monitor(self, interval: int = 5, grace_period=120, wall_time: Optional[int] = None) -> None:
+        iterations = 0
+        while True:
+            status = self.get_status()  # may be None just after submit
 
-            while self.is_active():
-
-                logger.info(f"job {self.job.job_name} is active")
-                time.sleep(interval)
-                iterations = iterations + 1
-
-                if wall_time is not None and iterations > int(wall_time / interval):
-                    logger.warning(
-                        "reached wall time for execution, killing job"  # noqa: E501
-                    )
-                    self.killed = True
-                    self.runtime_context.batch_v1_api.delete_namespaced_job(
-                        namespace=self.runtime_context.namespace,
-                        name=self.namespaced_job_name,
-                        timeout=wall_time,
-                    )
-                    return
-
-                if iterations > int(grace_period / interval):
-                    waiting_pods = self.get_waiting_pods()
-                    if waiting_pods:
-                        logger.warning(
-                            "found pods in waiting status with reason ImagePullBackOff, killing job"  # noqa: E501
-                        )
-                        self.killed = True
-                        self.runtime_context.batch_v1_api.delete_namespaced_job(
-                            namespace=self.runtime_context.namespace,
-                            name=self.namespaced_job_name,
-                            timeout=wall_time,
-                        )
-                        return
-
-            if self.is_complete():
+            if status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.KILLED):
                 logger.info("execution is complete")
-            if self.is_succeeded():
-                logger.info("the outcome is: success!")
+                if status is JobStatus.SUCCEEDED:
+                    logger.info("the outcome is: success!")
+                break
 
-        else:
-            logger.warning("job is not submitted")
+            if status is None:
+                logger.info(f"job {self.job.job_name} not visible/active yet; waiting...")
+            elif status is JobStatus.ACTIVE:
+                logger.info(f"job {self.job.job_name} is active")
+
+            time.sleep(interval)
+            iterations += 1
+
+            if wall_time is not None and iterations > int(wall_time / interval):
+                logger.warning("reached wall time for execution, killing job")
+                self.killed = True
+                self._delete_job(request_timeout=wall_time)
+                return
+
+            if iterations > int(grace_period / interval):
+                waiting_pods = self.get_waiting_pods()
+                if waiting_pods:
+                    logger.warning("found pods in waiting status with reason ImagePullBackOff, killing job")
+                    self.killed = True
+                    self._delete_job(request_timeout=wall_time)
+                    return
 
     def get_waiting_pods(self) -> List[V1Pod]:
 

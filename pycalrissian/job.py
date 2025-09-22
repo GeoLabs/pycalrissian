@@ -43,9 +43,11 @@ class CalrissianJob:
         debug: bool = False,
         no_read_only: bool = False,
         keep_pods: bool = False,
-        backoff_limit: int = 2,
+        backoff_limit: int = 0,
         tool_logs: bool = False,
-        ttl_seconds_after_finished: int = None
+        ttl_seconds_after_finished: int = None,
+        pod_annotations: Dict = None
+
     ):
 
         self.cwl = cwl
@@ -66,6 +68,7 @@ class CalrissianJob:
         self.volume_calrissian_wdir = "volume-calrissian-wdir"
         self.tool_logs = tool_logs
         self.ttl_seconds_after_finished = ttl_seconds_after_finished
+        self.pod_annotations = pod_annotations or {}
 
         if runtime_context.service_account is not None:
             logger.info(f"using '{runtime_context.service_account}' service account selected from runtime context")
@@ -83,6 +86,11 @@ class CalrissianJob:
                 f"job-{str(datetime.now().timestamp()).replace('.', '')}-{uuid.uuid4()}"
             )
         )
+
+        self.pod_labels = None
+        if self.runtime_context.labels is not None:
+            self.pod_labels = self.runtime_context.labels
+
         logger.info(f"job name: {self.job_name}")
         logger.info("create CWL config map")
         self._create_cwl_cm()
@@ -94,8 +102,16 @@ class CalrissianJob:
             self._create_pod_env_vars_cm()
 
         if self.pod_node_selector:
-            logger.info("create Pod node selector config map")
+            logger.info("create pod node selector config map")
             self._create_pod_node_selector_cm()
+
+        if self.pod_annotations:
+            logger.info("create pod annotations config map")
+            self._create_pod_annotations_cm()
+
+        if self.pod_labels is not None:
+            logger.info("create pod labels config map")
+            self._create_pod_labels_cm()
 
         self.calrissian_base_path = "/calrissian"
 
@@ -127,6 +143,22 @@ class CalrissianJob:
             content=json.dumps(self.pod_node_selector),
         )
 
+    def _create_pod_annotations_cm(self):
+        """Create configMap with pod annotations"""
+        self.runtime_context.create_configmap(
+            name="pod-annotations",
+            key="pod-annotations",
+            content=json.dumps(self.pod_annotations),
+        )
+
+    def _create_pod_labels_cm(self):
+        """Create configMap with pod labels"""
+        self.runtime_context.create_configmap(
+            name="pod-labels",
+            key="pod-labels",
+            content=json.dumps(self.pod_labels),
+        )
+
     def to_dict(self):
         """Serialize to a dictionary"""
         return self.to_k8s_job().to_dict()
@@ -139,15 +171,16 @@ class CalrissianJob:
                 return super().increase_indent(flow=flow, indentless=False)
 
         with open(file_path, "w", encoding="utf-8") as outfile:
+            job_yaml = self.to_k8s_job()
             yaml.dump(
                 self.runtime_context.api_client.sanitize_for_serialization(
-                    self.to_k8s_job()
+                    job_yaml
                 ),
                 outfile,
                 Dumper=Dumper,
                 default_flow_style=False,
             )
-        logger.info(f"job {self.job_name} serialized to {file_path}")
+        logger.info(f"job {self.job_name} serialized to {file_path} file content: \n {str(job_yaml)}")
 
     def to_k8s_job(self):
         """Cast to kubernetes Job"""
@@ -208,6 +241,7 @@ class CalrissianJob:
         ]
 
         if self.pod_env_vars:
+            logger.info(f"Adding pod_env_vars: {self.pod_env_vars}")
             pod_env_vars_volume = client.V1Volume(
                 name="volume-pod-env-vars",
                 config_map=client.V1ConfigMapVolumeSource(
@@ -231,6 +265,7 @@ class CalrissianJob:
             volume_mounts.append(pod_env_vars_volume_mount)
 
         if self.pod_node_selector:
+            logger.info(f"Adding pod_node_selector: {self.pod_node_selector}")
             pod_node_selector_volume = client.V1Volume(
                 name="volume-pod-node-selector",
                 config_map=client.V1ConfigMapVolumeSource(
@@ -254,6 +289,55 @@ class CalrissianJob:
             volumes.append(pod_node_selector_volume)
 
             volume_mounts.append(pod_node_selector_volume_mount)
+        
+        if self.pod_annotations:
+            logger.info(f"Adding pod_annotations: {self.pod_annotations}")
+            pod_annotations_volume = client.V1Volume(
+                name="volume-pod-annotations",
+                config_map=client.V1ConfigMapVolumeSource(
+                    name="pod-annotations",
+                    optional=False,
+                    items=[
+                        client.V1KeyToPath(
+                            key="pod-annotations",
+                            path="pod_annotations.json",
+                            mode=0o644,
+                        )
+                    ],
+                    default_mode=0o644,
+                ),
+            )
+            pod_annotations_volume_mount = client.V1VolumeMount(
+                mount_path="/pod-annotations",
+                name="volume-pod-annotations",
+            )
+            volumes.append(pod_annotations_volume)
+            volume_mounts.append(pod_annotations_volume_mount)
+        
+        if self.pod_labels:
+            logger.info(f"Adding pod_labels: {self.pod_labels}")
+            pod_labels_volume = client.V1Volume(
+                name="volume-pod-labels",
+                config_map=client.V1ConfigMapVolumeSource(
+                    name="pod-labels",
+                    optional=False,
+                    items=[
+                        client.V1KeyToPath(
+                            key="pod-labels",
+                            path="pod_labels.json",
+                            mode=0o644,
+                        )
+                    ],
+                    default_mode=0o644,
+                ),
+            )
+            pod_labels_volume_mount = client.V1VolumeMount(
+                mount_path="/pod-labels",
+                name="volume-pod-labels",
+            )
+            volumes.append(pod_labels_volume)
+            volume_mounts.append(pod_labels_volume_mount)
+
 
         pod_spec = self.create_pod_template(
             name="calrissian_pod",
@@ -262,7 +346,9 @@ class CalrissianJob:
             ],
             volumes=volumes,
             security_context=self.security_context,
-            service_account=self.service_account
+            service_account=self.service_account,
+            annotations=self.pod_annotations,
+            labels=self.pod_labels
         )
 
         return self.create_job(
@@ -270,7 +356,9 @@ class CalrissianJob:
             pod_template=pod_spec,
             namespace=self.runtime_context.namespace,
             backoff_limit=self.backoff_limit,
-            ttl_seconds_after_finished=self.ttl_seconds_after_finished
+            ttl_seconds_after_finished=self.ttl_seconds_after_finished,
+            annotations=self.pod_annotations,
+            labels=self.pod_labels
         )
 
     @staticmethod
@@ -301,33 +389,67 @@ class CalrissianJob:
 
     @staticmethod
     def create_pod_template(
-        name, containers, volumes, security_context, node_selector=None, service_account=None
+        name,
+        containers,
+        volumes,
+        security_context,
+        node_selector=None,
+        service_account=None,
+        labels=None,
+        annotations=None
     ):
-        """Creates the pod template with the three containers"""
+        """Create a PodTemplateSpec for the job, honoring labels and annotations."""
+
+        # Merge labels (user-provided override defaults on conflict)
+        merged_labels = {"pod_name": name}
+        if labels:
+            merged_labels.update(labels)
 
         pod_template = client.V1PodTemplateSpec(
+            metadata=client.V1ObjectMeta(
+                name=name,
+                labels=merged_labels,
+                annotations=annotations or {},
+            ),
             spec=client.V1PodSpec(
                 restart_policy="Never",
                 containers=containers,
                 volumes=volumes,
                 node_selector=node_selector,
                 security_context=client.V1PodSecurityContext(
-                    run_as_group=security_context["runAsGroup"],
-                    run_as_user=security_context["runAsUser"],
-                    fs_group=security_context["fsGroup"],
+                    run_as_group=security_context.get("runAsGroup"),
+                    run_as_user=security_context.get("runAsUser"),
+                    fs_group=security_context.get("fsGroup"),
                 ),
                 service_account_name=service_account,
                 termination_grace_period_seconds=120,
             ),
-            metadata=client.V1ObjectMeta(name=name, labels={"pod_name": name}),
         )
 
         return pod_template
 
+
     @staticmethod
-    def create_job(name, pod_template, namespace, backoff_limit=4, ttl_seconds_after_finished=None):
+    def create_job(
+        name,
+        pod_template,
+        namespace,
+        backoff_limit=4,
+        ttl_seconds_after_finished=None,
+        labels=None,
+        annotations=None,
+    ):
+        """Create a batch/v1 Job with merged labels and optional annotations."""
+
+        merged_labels = {"job-name": name}
+        if labels:
+            merged_labels.update(labels)
+
         metadata = client.V1ObjectMeta(
-            name=name, labels={"job_name": name}, namespace=namespace
+            name=name,
+            namespace=namespace,
+            labels=merged_labels,
+            annotations=annotations or {},
         )
 
         job = client.V1Job(
@@ -337,7 +459,7 @@ class CalrissianJob:
             spec=client.V1JobSpec(
                 backoff_limit=backoff_limit,
                 template=pod_template,
-                ttl_seconds_after_finished=ttl_seconds_after_finished
+                ttl_seconds_after_finished=ttl_seconds_after_finished,
             ),
         )
 
@@ -381,6 +503,17 @@ class CalrissianJob:
             args.extend(
                 ["--pod-env-vars", os.path.join("/pod-env-vars", "pod_env_vars.json")]
             )
+
+        if self.pod_annotations:
+            args.extend(
+                ["--pod-annotations", os.path.join("/pod-annotations", "pod_annotations.json")]
+            )
+
+        if self.pod_labels:
+            args.extend(
+                ["--pod-labels", os.path.join("/pod-labels", "pod_labels.json")]
+            )
+
         if self.service_account:
             args.extend(["--pod-serviceaccount", self.service_account])
 
