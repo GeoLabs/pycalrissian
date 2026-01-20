@@ -35,8 +35,8 @@ class CalrissianJob:
         cwl_entry_point: str = None,
         pod_env_vars: Dict = None,
         pod_node_selector: Dict = None,
-        max_ram: str = "8G",
-        max_cores: str = "16",
+        max_ram: str = "100G",
+        max_cores: str = "12",
         security_context: Dict = None,
         service_account: str = None,
         storage_class: str = None,
@@ -338,7 +338,6 @@ class CalrissianJob:
             volumes.append(pod_labels_volume)
             volume_mounts.append(pod_labels_volume_mount)
 
-
         pod_spec = self.create_pod_template(
             name="calrissian_pod",
             containers=[
@@ -348,7 +347,16 @@ class CalrissianJob:
             security_context=self.security_context,
             service_account=self.service_account,
             annotations=self.pod_annotations,
-            labels=self.pod_labels
+            labels=self.pod_labels,
+            node_selector = {"nodegroup": "high-mem"},
+            tolerations=[
+                client.V1Toleration(
+                    key="nodegroup",
+                    operator="Equal",
+                    value="high-mem",
+                    effect="NoSchedule"
+                )
+            ]
         )
 
         return self.create_job(
@@ -396,7 +404,8 @@ class CalrissianJob:
         node_selector=None,
         service_account=None,
         labels=None,
-        annotations=None
+        annotations=None,
+        tolerations=None,
     ):
         """Create a PodTemplateSpec for the job, honoring labels and annotations."""
 
@@ -416,6 +425,7 @@ class CalrissianJob:
                 containers=containers,
                 volumes=volumes,
                 node_selector=node_selector,
+                tolerations=tolerations,
                 security_context=client.V1PodSecurityContext(
                     run_as_group=security_context.get("runAsGroup"),
                     run_as_user=security_context.get("runAsUser"),
@@ -441,7 +451,7 @@ class CalrissianJob:
     ):
         """Create a batch/v1 Job with merged labels and optional annotations."""
 
-        merged_labels = {"job-name": name}
+        merged_labels = {"job-name": name, "nodegroup": "high-mem"}
         if labels:
             merged_labels.update(labels)
 

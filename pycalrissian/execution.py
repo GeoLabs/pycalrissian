@@ -6,6 +6,8 @@ from typing import Dict, List, Optional
 
 from kubernetes.client.models.v1_pod import V1Pod
 from kubernetes.client.rest import ApiException
+from kubernetes.client.models.v1_delete_options import V1DeleteOptions
+
 from loguru import logger
 
 from pycalrissian.context import CalrissianContext
@@ -13,6 +15,7 @@ from pycalrissian.job import CalrissianJob, ContainerNames
 from pycalrissian.utils import copy_from_volume
 
 SIDECAR_PREFIXES = ("vault-agent", "istio-proxy", "otel-collector")
+PENDING_LIMIT_SEC = 300  # 5 minutes
 
 class JobStatus(Enum):
     ACTIVE = "active"
@@ -20,13 +23,13 @@ class JobStatus(Enum):
     SUCCEEDED = "succeeded"
     KILLED = "killed"
 
-
 class CalrissianExecution:
     def __init__(self, job: CalrissianJob, runtime_context: CalrissianContext) -> None:
         self.job = job
         self.runtime_context = runtime_context
         self.namespaced_job = None
         self.killed = False
+        self.kill_cause = {"step": "job-setup", "exit_code": 0, "error_msg": "Execution Success"}
 
     def submit(self):
         """Submits the job to the cluster"""
@@ -38,7 +41,7 @@ class CalrissianExecution:
         self.namespaced_job = response
         logger.info(f"job {self.job.job_name} submitted")
 
-    def get_status(self):
+    def get_status2(self):
         """Returns the job status"""
         if self.killed:
             return JobStatus.KILLED
@@ -75,6 +78,29 @@ class CalrissianExecution:
             logger.error(f"Exception when calling get status: {e}\n")
             raise e
 
+    def get_status(self):
+        """Returns the job status"""
+        if self.killed:
+            return JobStatus.KILLED
+        try:
+            response = self.runtime_context.batch_v1_api.read_namespaced_job_status(
+                name=self.namespaced_job_name,
+                namespace=self.runtime_context.namespace,
+                pretty=True,
+            )
+            if response.status.active is None and response.status.start_time is None:
+                return JobStatus.ACTIVE
+            if response.status.active:
+                return JobStatus.ACTIVE
+            if response.status.succeeded:
+                return JobStatus.SUCCEEDED
+            if response.status.failed:
+                return JobStatus.FAILED
+            return None
+        except ApiException as e:
+            logger.error(f"Exception when calling get status: {e}\n")
+            raise e
+
     def is_complete(self) -> bool:
         """Returns True if the job execution is completed (success or failed)"""
         return self.get_status() in [
@@ -91,6 +117,14 @@ class CalrissianExecution:
         """Returns True if the job execution is on-going"""
         return self.get_status() in [JobStatus.ACTIVE]
 
+    def if_failed(self) -> bool:
+        """Returns True if the job execution failed"""
+        return self.get_status() in [JobStatus.FAILED]
+
+    def if_killed(self) -> bool:
+        """Returns True if the job execution failed"""
+        return self.get_status() in [JobStatus.KILLED]
+    
     def get_output(self) -> Dict:
         """Returns the job output"""
         if self.is_succeeded():
@@ -302,7 +336,7 @@ class CalrissianExecution:
         kwargs = {
             "name": self.namespaced_job_name,
             "namespace": self.runtime_context.namespace,
-            "body": self.runtime_context.batch_v1_api.V1DeleteOptions(
+            "body": V1DeleteOptions(
                 propagation_policy="Foreground",
                 grace_period_seconds=0,
             ),
@@ -314,16 +348,51 @@ class CalrissianExecution:
         except ApiException as e:
             logger.error(f"failed to delete job {self.namespaced_job_name}: {e}")
 
-    def monitor(self, interval: int = 5, grace_period=120, wall_time: Optional[int] = None) -> None:
+    def monitor(self, interval: int = 5, grace_period=120, wall_time: Optional[int] = None) -> Optional[str]:
+        """
+        Monitors the job. Returns:
+          - "OUT_OF_RESOURCES" if the pod stayed Pending > 5 minutes and scheduler shows insufficient cpu/memory
+          - "UNKNOWN_ERROR" if Pending > 5 minutes but no clear scheduler reason
+          - None otherwise (normal completion or other kill paths)
+        """
         iterations = 0
+        pending_since_ts: Optional[float] = None
+
         while True:
             status = self.get_status()  # may be None just after submit
-
+            logger.info("Job status is {status}")
             if status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.KILLED):
                 logger.info("execution is complete")
                 if status is JobStatus.SUCCEEDED:
                     logger.info("the outcome is: success!")
-                break
+                elif status is JobStatus.FAILED:
+                    logger.info("the outcome is: failed!")
+                elif status is JobStatus.KILLED:
+                    logger.info("the outcome is: killed!")
+                return None
+
+            # -- NEW: inspect the Calrissian job pod to track Pending time
+            pod = self._pick_job_pod()
+            if pod and pod.status and pod.status.phase == "Pending":
+                if pending_since_ts is None:
+                    pending_since_ts = time.time()
+                    logger.info(f"Pod {pod.metadata.name} entered Pending; starting 5m timer")
+                elif time.time() - pending_since_ts >= PENDING_LIMIT_SEC:
+                    # Pending time threshold: decide cause and kill
+                    events = self._pod_events_text(pod.metadata.name).lower()
+                    if ("insufficient memory" in events) or ("insufficient cpu" in events or ("Pod unscheduled" in events)):
+                        error_msg = "OUT_OF_RESOURCES: Scheduler reports insufficient CPU or memory to place the pod."
+                    else:
+                        error_msg = "UNKNOWN_ERROR: Scheduler could not schedule the job. Please contact the admin."
+                    logger.warning(f"Killing job {self.job.job_name} error message: {self.kill_cause}")
+                    self.kill_cause["error_msg"] = error_msg
+                    self.kill_cause["exit_code"] = -1
+                    self.killed = True
+                    self._delete_job(request_timeout=wall_time)
+                    return self.kill_cause
+            else:
+                # reset the timer if we leave Pending (e.g., moved to Running, Succeeded, etc.)
+                pending_since_ts = None
 
             if status is None:
                 logger.info(f"job {self.job.job_name} not visible/active yet; waiting...")
@@ -333,22 +402,17 @@ class CalrissianExecution:
             time.sleep(interval)
             iterations += 1
 
+            # Existing wall-time guard
             if wall_time is not None and iterations > int(wall_time / interval):
                 logger.warning("reached wall time for execution, killing job")
                 self.killed = True
+                self.kill_cause["error_msg"] = "DEADLINE_EXCEEDED: Monitor wall time exceeded."
+                self.kill_cause["exit_code"] = -1
                 self._delete_job(request_timeout=wall_time)
-                return
+                return self.kill_cause
 
-            if iterations > int(grace_period / interval):
-                waiting_pods = self.get_waiting_pods()
-                if waiting_pods:
-                    logger.warning("found pods in waiting status with reason ImagePullBackOff, killing job")
-                    self.killed = True
-                    self._delete_job(request_timeout=wall_time)
-                    return
 
     def get_waiting_pods(self) -> List[V1Pod]:
-
         pods_waiting = []
 
         response = self.runtime_context.core_v1_api.list_namespaced_pod(
@@ -357,13 +421,41 @@ class CalrissianExecution:
 
         if response is not None:
             for pod in response.items:
-                if pod.status.container_statuses:
+                if pod.status.container_statuses and "job" in pod.metadata.name:
                     for con_status in pod.status.container_statuses:
 
                         if (
                             con_status.state.waiting
-                            and con_status.state.waiting.reason in ["ImagePullBackOff"]
+                            and con_status.state.waiting.reason in ["ImagePullBackOff", "ErrImagePull", "InvalidImageName"]
                         ):
-                            pods_waiting.append(pod)
+                            pods_waiting.append(pod.metadata.name)
 
         return pods_waiting
+
+    def _pick_job_pod(self) -> Optional[V1Pod]:
+        pods = self.runtime_context.core_v1_api.list_namespaced_pod(
+            namespace=self.runtime_context.namespace,
+            label_selector=f"job-name={self.job.job_name}",
+            timeout_seconds=10,
+        ).items
+        if not pods:
+            logger.debug(f"No pods found yet for job {self.job.job_name}")
+            return None
+        pod = sorted(
+            pods,
+            key=lambda p: (p.status.start_time or p.metadata.creation_timestamp),
+            reverse=True,
+        )[0]
+        return pod
+
+    def _pod_events_text(self, pod_name: str) -> str:
+        try:
+            ev = self.runtime_context.core_v1_api.list_namespaced_event(
+                namespace=self.runtime_context.namespace,
+                field_selector=f"involvedObject.name={pod_name}",
+                _request_timeout=10,
+            )
+            return "\n".join(f"{e.reason}: {e.message}" for e in (ev.items or []))
+        except Exception as e:
+            logger.debug(f"Could not fetch events for pod {pod_name}: {e}")
+            return ""
